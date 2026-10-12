@@ -1,0 +1,74 @@
+import assert from 'node:assert/strict';
+import { startWorker } from './worker-harness.mjs';
+import { spawn } from 'node:child_process';
+
+let worker = await startWorker();
+const dir = worker.dir;
+let checks = 0;
+const check = (actual, expected, message) => { assert.equal(actual, expected, message); checks++; };
+const request = (path, data, cookie, extra = {}) => fetch(worker.url + path, { ...(data === undefined ? {} : { method: 'POST', body: JSON.stringify(data) }), headers: { ...(data === undefined ? {} : { 'Content-Type': 'application/json' }), ...(cookie ? { Cookie: cookie } : {}), ...extra }, redirect: 'manual' });
+const cookieFrom = res => res.headers.get('set-cookie').split(';')[0];
+const event = (seq, type, data, atMs = seq * 1000) => ({ seq, type, data, atMs });
+try {
+  check((await request('/')).status, 403, 'Anonymous prototype access is closed');
+  check((await request('/app.js')).status, 403);
+  check((await request('/index.html')).status, 404, 'Direct static asset path cannot bypass the Worker');
+  check((await request('/access.html')).status, 404);
+  check((await request('/api/sessions', {})).status, 403);
+  check((await request('/api/admin/invitation')).status, 401);
+  check((await request('/api/admin/login', { password: 'wrong' })).status, 401);
+  const admin = cookieFrom(await request('/api/admin/login', { password: 'browser-test-password' }));
+  const invitation = await (await request('/api/admin/invitation', undefined, admin)).json();
+  check((await request('/invite/invalid')).status, 404);
+  const invite = await request(invitation.path);
+  check(invite.status, 303);
+  const inviteCookie = cookieFrom(invite);
+  check((await request('/api/sessions', {}, inviteCookie)).status, 403, 'Invitation alone does not grant access');
+  check((await request('/api/access/login', { password: 'participant-test-password' })).status, 403, 'Password alone without invitation is rejected');
+  check((await request('/api/access/login', { password: 'wrong' }, inviteCookie)).status, 401);
+  const access = cookieFrom(await request('/api/access/login', { password: 'participant-test-password' }, inviteCookie));
+  check((await request('/api/admin/sessions', undefined, access)).status, 401, 'Participant login cannot read results');
+  const page = await request('/', undefined, access);
+  check(page.status, 200);
+  assert.match(await page.text(), /Исследование/);
+  assert.match(page.headers.get('x-robots-tag'), /noindex/);
+  const s = await (await request('/api/sessions', { width: 1440, height: 900 }, access)).json();
+  const s2 = await (await request('/api/sessions', {}, access)).json();
+  const path = `/api/sessions/${s.id}/events`;
+  check((await request(path, { token: s2.token, events: [event(1, 'study_started', {})] }, access)).status, 401);
+  check((await request(path, { token: s.token, events: [event(1, 'study_started', {}), event(2, 'state_view', { state: 'unknown' })] }, access)).status, 400);
+  let detail = await (await request(`/api/admin/sessions/${s.id}`, undefined, admin)).json();
+  check(detail.eventCount, 0, 'Invalid batch performs no writes');
+  const events = [event(1, 'study_started', {}), event(2, 'task_started', { task: 1 }), event(3, 'click', { target: 'Диадок' }), event(4, 'state_view', { state: 'diadoc.current', organization: 'mine' }), event(5, 'task_result', { task: 1, outcome: 'completed', answer: 'Общий плюс, до 10 ноября 2026' }), event(6, 'task_started', { task: 2 }), event(7, 'state_view', { state: 'extern.current', organization: 'romashka' }), event(8, 'task_result', { task: 2, outcome: 'completed', answer: '=1+1,"quote"' }), event(9, 'study_completed', {})];
+  check((await request(path, { token: s.token, events }, access)).status, 200);
+  check((await request(path, { token: s.token, events }, access)).status, 200);
+  detail = await (await request(`/api/admin/sessions/${s.id}`, undefined, admin)).json();
+  check(detail.eventCount, 9, 'Retries do not duplicate events');
+  check(detail.status, 'completed');
+  check(detail.tasks[0].durationMs, 3000);
+  check(detail.tasks[0].relevantScreenVisited, true);
+  check(detail.tasks[1].relevantScreenVisited, true);
+  check(detail.clicks, 1);
+  assert.match(await (await request('/api/admin/export.csv', undefined, admin)).text(), /'=1\+1,""quote""/);
+  check((await request('/api/admin/invitation', { action: 'disable' }, admin)).status, 200);
+  check((await request('/', undefined, access)).status, 403, 'Disabling also revokes existing cookies');
+  await worker.stop();
+  worker = await startWorker({ stateDir: dir, initialized: true });
+  check((await request(invitation.path)).status, 404, 'Disabled status survives restart');
+  detail = await (await request(`/api/admin/sessions/${s.id}`, undefined, admin)).json();
+  check(detail.eventCount, 9, 'D1 events survive restart');
+  const fresh = await (await request('/api/admin/invitation', { action: 'renew' }, admin)).json();
+  assert.notEqual(fresh.path, invitation.path);
+  check((await request(invitation.path)).status, 404, 'Old invitation stays revoked');
+  check((await request('/', undefined, access)).status, 403, 'Old session stays revoked');
+  check((await request('/api/admin/invitation', { action: 'disable' }, admin, { Origin: 'https://other.example' })).status, 403);
+  if (process.env.PLAYWRIGHT_MODULE) {
+    const child = spawn(process.execPath, ['tests/browser-smoke.mjs'], { env: { ...process.env, RESEARCH_BASE_URL: worker.url, RESEARCH_PARTICIPANT_PASSWORD: 'participant-test-password' }, stdio: 'inherit' });
+    const exit = await new Promise(done => child.once('exit', done));
+    check(exit, 0, 'Browser flows pass against Cloudflare Worker');
+  }
+  console.log(`Cloudflare Worker + local D1: ${checks} checks passed (auth, sessions, atomic writes, retries, exports, revocation and restart persistence).`);
+} catch (error) {
+  console.error(worker.logs());
+  throw error;
+} finally { await worker.stop(); worker.cleanup(); }

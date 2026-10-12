@@ -1,0 +1,19 @@
+{
+  "name": "kontur-research-prototype",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "dev:cloudflare": "wrangler dev --local",
+    "deploy:cloudflare": "node scripts/deploy.mjs",
+    "test:cloudflare": "node tests/cloudflare-smoke.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}

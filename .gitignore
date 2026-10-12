@@ -1,0 +1,10 @@
+node_modules/
+.data/
+.env
+test-results/
+playwright-report/
+.wrangler/
+.wrangler.deploy.json
+.dev.vars
+.dev.vars.*
+dist/
